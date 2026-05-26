@@ -1,79 +1,153 @@
 import torch
 import json
+import numpy as np
 from PIL import Image, ImageDraw
 import os
 from dotenv import load_dotenv
 
 from sam3.model_builder import build_sam3_image_model
 from sam3.model.sam3_image_processor import Sam3Processor
+from sam3.model.box_ops import box_cxcywh_to_xyxy
 
 def main():
-    # Load environment variables from .env file
     load_dotenv()
 
-    # Load the model
     print("Loading SAM 3 model...")
     model = build_sam3_image_model()
     processor = Sam3Processor(model)
     
-    # Determine the image path
-    image_dir = "test"
-    image_path = os.path.join(image_dir, "basketball-frame.jpg")
+    image_path = os.path.join("test", "basketball-frame.jpg")
     if not os.path.exists(image_path):
-        image_path = os.path.join(image_dir, "basket3.png")
-        if not os.path.exists(image_path):
-            raise FileNotFoundError("Could not find basketball image in the test directory.")
+        image_path = os.path.join("test", "basket3.png")
         
-    print(f"Loading image from {image_path}...")
     image = Image.open(image_path).convert("RGB")
-    inference_state = processor.set_image(image)
+    width, height = image.size
     
-    # Prompt the model with text
-    prompt = "players of both team, referees, court landmark - for a later homography, including the backet"
-    print(f"Sending prompt: '{prompt}'")
-    output = processor.set_text_prompt(state=inference_state, prompt=prompt)
+    # 1. TARGETED PROMPTS
+    prompts = [
+        "basketball player in white jersey", 
+        "basketball player in blue jersey", 
+        "referee in black pants", 
+        "basketball court lines and landmarks", 
+        "basketball hoop and orange rim",
+        "wooden basketball court floor",       # Core ROI (5)
+        "spectators in the background",        # Noise (6)
+        "players sitting on the bench"          # Noise (7)
+    ]
+    
+    colors = [
+        (255, 255, 255), # White team
+        (0, 100, 255),   # Blue team
+        (255, 255, 0),   # Referees
+        (0, 255, 0),     # Landmarks
+        (255, 100, 0),   # Basket
+    ]
+    
+    print(f"Running multi-class competition with weighted spatial grounding...")
+    
+    with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        inference_state = processor.set_image(image)
+        num_prompts = len(prompts)
+        processor.find_stage.text_ids = torch.arange(num_prompts, device="cuda")
+        processor.find_stage.img_ids = torch.zeros(num_prompts, dtype=torch.long, device="cuda")
+        
+        text_outputs = model.backbone.forward_text(prompts, device="cuda")
+        inference_state["backbone_out"].update(text_outputs)
+        inference_state["geometric_prompt"] = model._get_dummy_prompt(num_prompts=num_prompts)
+            
+        outputs = model.forward_grounding(
+            backbone_out=inference_state["backbone_out"],
+            find_input=processor.find_stage,
+            geometric_prompt=inference_state["geometric_prompt"],
+            find_target=None,
+        )
 
-    # Get the masks, bounding boxes, and scores
-    masks = output.get("masks", [])
-    boxes = output.get("boxes", [])
-    scores = output.get("scores", [])
-    
-    boxes_list = boxes.tolist() if hasattr(boxes, 'tolist') else boxes
-    scores_list = scores.tolist() if hasattr(scores, 'tolist') else scores
+        out_logits = outputs["pred_logits"].sigmoid().squeeze(-1)
+        presence_score = outputs["presence_logit_dec"].sigmoid()
+        final_scores = out_logits * presence_score
+        
+        scores_per_query = final_scores.t()
+        best_scores, best_prompt_indices = scores_per_query.max(dim=-1)
+        
+        # BALANCE: threshold set to 0.20 to filter weak detections
+        keep = best_scores > 0.20 
+        keep_indices = torch.where(keep)[0]
 
-    # Prepare JSON data
-    results = {
-        "prompt": prompt,
-        "image": image_path,
-        "detections": []
-    }
+    # --- STRICT COURT ROI (Wooden Floor Only) ---
+    # We use only the wooden floor to keep the boundary tight
+    court_mask = np.zeros((height, width), dtype=bool)
+    floor_prompt_idx = 5
+    for idx in keep_indices:
+        if best_prompt_indices[idx].item() == floor_prompt_idx:
+            m_logits = outputs["pred_masks"][floor_prompt_idx, idx].unsqueeze(0).unsqueeze(0)
+            m = torch.nn.functional.interpolate(m_logits, (height, width), mode="bilinear").sigmoid().squeeze() > 0.5
+            court_mask = np.logical_or(court_mask, m.cpu().numpy())
     
-    draw = ImageDraw.Draw(image)
-    
-    for i, box in enumerate(boxes_list):
-        score = float(scores_list[i]) if i < len(scores_list) else None
-        results["detections"].append({
-            "id": i,
-            "box": box,
-            "score": score
-        })
-        # Draw the bounding box for visual check
-        if len(box) == 4:
-            draw.rectangle(box, outline="red", width=3)
-            # Optional: Add score text
-            if score is not None:
-                draw.text((box[0], max(0, box[1]-10)), f"{score:.2f}", fill="red")
+    # NO DILATION: Keep the floor boundary strict
+    # ---------------------------------------------
 
-    # Output JSON
-    json_path = "output.json"
-    with open(json_path, "w") as f:
+    vis_image = image.copy()
+    draw = ImageDraw.Draw(vis_image)
+    results = {"detections": []}
+
+    for idx in keep_indices:
+        p_idx = best_prompt_indices[idx].item()
+        score = best_scores[idx].item()
+        
+        if p_idx >= 5: continue 
+            
+        # Get object mask
+        mask_logits = outputs["pred_masks"][p_idx, idx].unsqueeze(0).unsqueeze(0)
+        mask_upscaled = torch.nn.functional.interpolate(mask_logits, (height, width), mode="bilinear").sigmoid().squeeze() > 0.5
+        mask_np = mask_upscaled.cpu().numpy()
+        
+        # WEIGHTED SPATIAL GROUNDING
+        if p_idx in [0, 1, 2]: # Players/Referees
+            # 1. Get the bounding box to find the bottom region
+            box_cxcywh = outputs["pred_boxes"][p_idx, idx]
+            box_xyxy = box_cxcywh_to_xyxy(box_cxcywh.unsqueeze(0)).squeeze(0)
+            b = (box_xyxy * torch.tensor([width, height, width, height], device="cuda")).tolist()
+            
+            # 2. Define the "Foot Region" (Bottom 25% of the detection)
+            y_foot_start = int(b[1] + (b[3] - b[1]) * 0.75)
+            y_foot_end = int(b[3])
+            x_start = int(b[0])
+            x_end = int(b[2])
+            
+            # Ensure indices are within bounds
+            y_foot_start = max(0, min(height-1, y_foot_start))
+            y_foot_end = max(0, min(height, y_foot_end))
+            x_start = max(0, min(width-1, x_start))
+            x_end = max(0, min(width, x_end))
+            
+            # 3. Check for overlap in the FOOT REGION only
+            # Bench players will have their feet on the sideline/bench area, not the wooden floor ROI
+            foot_mask_slice = mask_np[y_foot_start:y_foot_end, x_start:x_end]
+            court_mask_slice = court_mask[y_foot_start:y_foot_end, x_start:x_end]
+            
+            overlap = np.logical_and(foot_mask_slice, court_mask_slice)
+            if not np.any(overlap):
+                continue
+        
+        # If we reached here, the detection is grounded on the court
+        box_cxcywh = outputs["pred_boxes"][p_idx, idx]
+        box_xyxy = box_cxcywh_to_xyxy(box_cxcywh.unsqueeze(0)).squeeze(0)
+        box = (box_xyxy * torch.tensor([width, height, width, height], device="cuda")).tolist()
+        
+        color = colors[p_idx]
+        results["detections"].append({"class": prompts[p_idx], "box": box, "score": score})
+        
+        mask_layer = np.zeros((height, width, 4), dtype=np.uint8)
+        mask_layer[mask_np] = list(color) + [130]
+        vis_image.paste(Image.fromarray(mask_layer, 'RGBA'), (0, 0), Image.fromarray(mask_layer, 'RGBA'))
+        
+        draw.rectangle(box, outline=color, width=2)
+        draw.text((box[0], max(0, box[1]-10)), f"{score:.2f}", fill=color)
+
+    with open("output.json", "w") as f:
         json.dump(results, f, indent=4)
-    print(f"Results written to {json_path}")
-    
-    # Output visual check image
-    output_image_path = "output_visual.jpg"
-    image.save(output_image_path)
-    print(f"Visual check image saved to {output_image_path}")
+    vis_image.save("output_visual.jpg")
+    print(f"\nFinalized {len(results['detections'])} grounded on-court detections.")
 
 if __name__ == "__main__":
     main()

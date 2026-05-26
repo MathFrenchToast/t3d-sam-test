@@ -27,12 +27,12 @@ def main():
     prompts = [
         "basketball player wearing a white jersey uniform", 
         "basketball player wearing a blue jersey uniform", 
-        "referee in black and white vertical striped shirt", 
+        "referee in black pants and black and grey shirt", 
         "white lines and landmarks on the basketball court", 
         "basketball hoop and orange rim",
         "wooden basketball court floor",       # Core ROI (5)
         "spectators in the background",        # Noise (6)
-        "people sitting on the bench"          # Noise (7)
+        "players sitting on the bench"          # Noise (7)
     ]
     
     colors = [
@@ -73,17 +73,27 @@ def main():
         keep = best_scores > 0.20 
         keep_indices = torch.where(keep)[0]
 
-    # --- STRICT COURT ROI (Wooden Floor Only) ---
-    # We use only the wooden floor to keep the boundary tight
+    # --- ROBUST COURT ROI (Floor + Landmarks) ---
     court_mask = np.zeros((height, width), dtype=bool)
-    floor_prompt_idx = 5
-    for idx in keep_indices:
-        if best_prompt_indices[idx].item() == floor_prompt_idx:
-            m_logits = outputs["pred_masks"][floor_prompt_idx, idx].unsqueeze(0).unsqueeze(0)
-            m = torch.nn.functional.interpolate(m_logits, (height, width), mode="bilinear").sigmoid().squeeze() > 0.5
-            court_mask = np.logical_or(court_mask, m.cpu().numpy())
+    # Use both floor (5) and landmarks (3) to define the court area
+    for c_idx in [3, 5]:
+        for idx in keep_indices:
+            if best_prompt_indices[idx].item() == c_idx:
+                m_logits = outputs["pred_masks"][c_idx, idx].unsqueeze(0).unsqueeze(0)
+                m = torch.nn.functional.interpolate(m_logits, (height, width), mode="bilinear").sigmoid().squeeze() > 0.5
+                court_mask = np.logical_or(court_mask, m.cpu().numpy())
     
-    # NO DILATION: Keep the floor boundary strict
+    court_area_pct = (np.sum(court_mask) / (width * height)) * 100
+    print(f"Court ROI coverage: {court_area_pct:.2f}% of image")
+    
+    # Optional: Small dilation to close gaps in landmarks/floor
+    temp_mask = court_mask.copy()
+    for shift in [1, 2, 5]:
+        temp_mask[shift:, :] |= court_mask[:-shift, :]
+        temp_mask[:-shift, :] |= court_mask[shift:, :]
+        temp_mask[:, shift:] |= court_mask[:, :-shift]
+        temp_mask[:, :-shift] |= court_mask[:, shift:]
+    court_mask = temp_mask
     # ---------------------------------------------
 
     vis_image = image.copy()

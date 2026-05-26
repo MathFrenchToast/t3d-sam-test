@@ -25,14 +25,14 @@ def main():
     
     # 1. TARGETED PROMPTS
     prompts = [
-        "basketball player in white jersey", 
-        "basketball player in blue jersey", 
-        "referee in black pants", 
-        "basketball court lines and landmarks", 
+        "basketball player wearing a white jersey uniform", 
+        "basketball player wearing a blue jersey uniform", 
+        "referee in black and white vertical striped shirt", 
+        "white lines and landmarks on the basketball court", 
         "basketball hoop and orange rim",
         "wooden basketball court floor",       # Core ROI (5)
         "spectators in the background",        # Noise (6)
-        "players sitting on the bench"          # Noise (7)
+        "people sitting on the bench"          # Noise (7)
     ]
     
     colors = [

@@ -1,9 +1,13 @@
 Pillow>=9.0.0
-numpy
+numpy<2,>=1.26
 huggingface_hub
 python-dotenv
 einops
 triton
 pycocotools
 psutil
+opencv-python-headless
+openai
+requests
+matplotlib
 git+https://github.com/facebookresearch/sam3.git
